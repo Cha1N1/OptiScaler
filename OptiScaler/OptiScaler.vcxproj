@@ -261,6 +261,8 @@ copy $(SolutionDir)external\FidelityFX-SDK-v2\docs\license.md $(SolutionDir)x64\
 copy $(SolutionDir)OptiScaler.ini $(SolutionDir)x64\Release\a\ /Y
 copy $(SolutionDir)setup_windows.bat $(SolutionDir)x64\Release\a\ /Y
 copy $(SolutionDir)setup_linux.sh $(SolutionDir)x64\Release\a\ /Y
+copy $(SolutionDir)Streamlined_fetcher_windows.bat $(SolutionDir)x64\Release\a\OptiScaler /Y
+copy $(SolutionDir)Streamlined_fetcher_linux.sh $(SolutionDir)x64\Release\a\OptiScaler /Y
 md $(SolutionDir)x64\Release\a\OptiScaler\D3D12_OptiScaler\
 copy "$(SolutionDir)external\directx_agility_sdk\lib\*.dll" $(SolutionDir)x64\Release\a\OptiScaler\D3D12_OptiScaler\ /Y
 copy "$(SolutionDir)external\directx_agility_sdk\LICENSE.txt" $(SolutionDir)x64\Release\a\Licenses\DirectX_LICENSE.txt /Y
