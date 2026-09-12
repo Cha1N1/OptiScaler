@@ -1085,6 +1085,8 @@ inline static std::string GetSourceString(UINT source)
         return "SCR";
     case 64:
         return "SGR";
+    case 128:
+        return "OMUAV";
     default:
         return std::format("{}", source);
     }
@@ -1094,6 +1096,8 @@ inline static std::string GetDispatchString(UINT source)
 {
     switch (source)
     {
+    case 0:
+        return "-";
     case 512:
         return "DI";
     case 1024:
@@ -4272,8 +4276,12 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
              (state.activeFgOutput == FGOutput::XeFG && XeFGProxy::Module() != nullptr) ||
              (state.activeFgOutput == FGOutput::DLSSG && StreamlineProxy::Module() != nullptr)))
         {
-            if (!Config::Instance()->FGDisableHUDFix.value_or_default() &&
-                state.swapchainInteropApi == SwapchainInteropApi::None)
+            const bool dx11HudfixTracking = state.swapchainInteropApi == SwapchainInteropApi::Dx11wDx12;
+            const bool hudfixTrackingSupported =
+                !Config::Instance()->FGDisableHUDFix.value_or_default() &&
+                (state.swapchainInteropApi == SwapchainInteropApi::None || dx11HudfixTracking);
+
+            if (hudfixTrackingSupported)
             {
                 bool fgHudfix = config->FGHUDFix.value_or_default();
 
@@ -4358,8 +4366,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             {
                 ScopedIndent indent {};
 
-                if (!Config::Instance()->FGDisableHUDFix.value_or_default() &&
-                    state.swapchainInteropApi == SwapchainInteropApi::None)
+                if (hudfixTrackingSupported)
                 {
                     ImGui::Spacing();
 
@@ -4426,14 +4433,20 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                     ImGui::Spacing();
                     if (ImGui::TreeNode("Tracking Settings"))
                     {
+                        ImGui::BeginDisabled(dx11HudfixTracking);
+
                         auto ath = config->FGAlwaysTrackHeaps.value_or_default();
                         if (ImGui::Checkbox("Always Track Heaps", &ath))
                         {
                             config->FGAlwaysTrackHeaps = ath;
                             LOG_DEBUG("Enabled set FGAlwaysTrackHeaps: {}", ath);
                         }
-                        ShowHelpMarker("Always track resources, might cause performance issues\n, but also might "
-                                       "fix HUDFix related crashes!");
+                        ImGui::EndDisabled();
+
+                        ShowHelpMarker(dx11HudfixTracking
+                                           ? "D3D12 only; not applicable to DX11."
+                                           : "Always track resources, might cause performance issues\n, but also might "
+                                             "fix HUDFix related crashes!");
 
                         auto disableRTV = config->FGHudfixDisableRTV.value_or_default();
                         if (ImGui::Checkbox("Disable RTV Tracking", &disableRTV))
