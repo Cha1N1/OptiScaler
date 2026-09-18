@@ -146,7 +146,7 @@ static std::atomic<unsigned> gHeapGeneration { 1 };
 static thread_local HeapCacheTLS cacheGR;
 static thread_local HeapCacheTLS cacheCR;
 
-bool ResTrack_Dx12::CheckResource(ID3D12Resource* resource)
+bool ResTrack_Dx12::CheckResource(ID3D12Resource* resource, ResourceInfo* outInfo)
 {
     if (State::Instance().isShuttingDown)
         return false;
@@ -175,17 +175,27 @@ bool ResTrack_Dx12::CheckResource(ID3D12Resource* resource)
     if (resDesc.Height != s.currentSwapchainDesc.BufferDesc.Height ||
         resDesc.Width != s.currentSwapchainDesc.BufferDesc.Width)
     {
-        auto result = Config::Instance()->FGRelaxedResolutionCheck.value_or_default() &&
-                      resDesc.Height >= s.currentSwapchainDesc.BufferDesc.Height - 32 &&
-                      resDesc.Height <= s.currentSwapchainDesc.BufferDesc.Height + 32 &&
-                      resDesc.Width >= s.currentSwapchainDesc.BufferDesc.Width - 32 &&
-                      resDesc.Width <= s.currentSwapchainDesc.BufferDesc.Width + 32;
+        if (!(Config::Instance()->FGRelaxedResolutionCheck.value_or_default() &&
+              resDesc.Height >= s.currentSwapchainDesc.BufferDesc.Height - 32 &&
+              resDesc.Height <= s.currentSwapchainDesc.BufferDesc.Height + 32 &&
+              resDesc.Width >= s.currentSwapchainDesc.BufferDesc.Width - 32 &&
+              resDesc.Width <= s.currentSwapchainDesc.BufferDesc.Width + 32))
+        {
+            return false;
+        }
 
         // LOG_TRACK("Resource: {}x{} ({}), Swapchain: {}x{} ({}), Relaxed Result: {}", resDesc.Width, resDesc.Height,
         //           (UINT) resDesc.Format, scDesc.BufferDesc.Width, scDesc.BufferDesc.Height,
         //           (UINT) scDesc.BufferDesc.Format, result);
+    }
 
-        return result;
+    if (outInfo != nullptr)
+    {
+        outInfo->buffer = resource;
+        outInfo->width = resDesc.Width;
+        outInfo->height = resDesc.Height;
+        outInfo->format = resDesc.Format;
+        outInfo->flags = resDesc.Flags;
     }
 
     return true;
@@ -420,16 +430,6 @@ std::shared_ptr<HeapInfo> ResTrack_Dx12::GetHeapByGpuHandleCR(SIZE_T gpuHandle)
 
 #pragma region Hudless methods
 
-void ResTrack_Dx12::FillResourceInfo(ID3D12Resource* resource, ResourceInfo* info)
-{
-    auto desc = resource->GetDesc();
-    info->buffer = resource;
-    info->width = desc.Width;
-    info->height = desc.Height;
-    info->format = desc.Format;
-    info->flags = desc.Flags;
-}
-
 bool ResTrack_Dx12::IsHudFixActive()
 {
     if (!Config::Instance()->FGEnabled.value_or_default() || !Config::Instance()->FGHUDFix.value_or_default())
@@ -504,7 +504,8 @@ void ResTrack_Dx12::hkCreateRenderTargetView(ID3D12Device* This, ID3D12Resource*
     if (Config::Instance()->FGHudfixDisableRTV.value_or_default())
         return;
 
-    if (pResource == nullptr || !CheckResource(pResource))
+    ResourceInfo resInfo {};
+    if (pResource == nullptr || !CheckResource(pResource, &resInfo))
     {
         auto heap = GetHeapByCpuHandleRTV(DestDescriptor.ptr);
 
@@ -520,8 +521,6 @@ void ResTrack_Dx12::hkCreateRenderTargetView(ID3D12Device* This, ID3D12Resource*
     auto heap = GetHeapByCpuHandleRTV(DestDescriptor.ptr);
     if (heap != nullptr)
     {
-        ResourceInfo resInfo {};
-        FillResourceInfo(pResource, &resInfo);
         resInfo.type = RTV;
         resInfo.captureInfo = CaptureInfo::CreateRTV;
         heap->SetByCpuHandle(DestDescriptor.ptr, resInfo);
@@ -558,7 +557,8 @@ void ResTrack_Dx12::hkCreateShaderResourceView(ID3D12Device* This, ID3D12Resourc
     if (Config::Instance()->FGHudfixDisableSRV.value_or_default())
         return;
 
-    if (pResource == nullptr || !CheckResource(pResource))
+    ResourceInfo resInfo {};
+    if (pResource == nullptr || !CheckResource(pResource, &resInfo))
     {
         auto heap = GetHeapByCpuHandleSRV(DestDescriptor.ptr);
 
@@ -574,8 +574,6 @@ void ResTrack_Dx12::hkCreateShaderResourceView(ID3D12Device* This, ID3D12Resourc
     auto heap = GetHeapByCpuHandleSRV(DestDescriptor.ptr);
     if (heap != nullptr)
     {
-        ResourceInfo resInfo {};
-        FillResourceInfo(pResource, &resInfo);
         resInfo.type = SRV;
         resInfo.captureInfo = CaptureInfo::CreateSRV;
         heap->SetByCpuHandle(DestDescriptor.ptr, resInfo);
@@ -612,7 +610,8 @@ void ResTrack_Dx12::hkCreateUnorderedAccessView(ID3D12Device* This, ID3D12Resour
     if (Config::Instance()->FGHudfixDisableUAV.value_or_default())
         return;
 
-    if (pResource == nullptr || !CheckResource(pResource))
+    ResourceInfo resInfo {};
+    if (pResource == nullptr || !CheckResource(pResource, &resInfo))
     {
         auto heap = GetHeapByCpuHandleUAV(DestDescriptor.ptr);
 
@@ -628,8 +627,6 @@ void ResTrack_Dx12::hkCreateUnorderedAccessView(ID3D12Device* This, ID3D12Resour
     auto heap = GetHeapByCpuHandleUAV(DestDescriptor.ptr);
     if (heap != nullptr)
     {
-        ResourceInfo resInfo {};
-        FillResourceInfo(pResource, &resInfo);
         resInfo.type = UAV;
         resInfo.captureInfo = CaptureInfo::CreateUAV;
         heap->SetByCpuHandle(DestDescriptor.ptr, resInfo);
@@ -850,6 +847,7 @@ ULONG ResTrack_Dx12::hkRelease(ID3D12Resource* This)
         return o_Release(This);
 
     std::vector<TrackedResourceSlot> toClean;
+    bool finalRelease = false;
     {
         std::lock_guard lock(_trackedResourcesMutex);
 
@@ -858,15 +856,18 @@ ULONG ResTrack_Dx12::hkRelease(ID3D12Resource* This)
 
         if (refCount <= 1)
         {
+            finalRelease = true;
+
             if (auto it = _trackedResources.find(This); it != _trackedResources.end())
             {
                 toClean = std::move(it->second);
                 _trackedResources.erase(it);
             }
-
-            State::Instance().capturedHudlesses.erase(This);
         }
     }
+
+    if (finalRelease)
+        Hudfix_Dx12::RemoveResourceFromTracking(This);
 
     // Clean descriptor slots outside the reverse-index lock.
     for (const auto& slot : toClean)
@@ -1382,7 +1383,6 @@ void ResTrack_Dx12::hkDrawInstanced(ID3D12GraphicsCommandList* This, UINT Vertex
             if (Config::Instance()->FGHudfixDisableDI.value_or_default())
                 break;
 
-            std::lock_guard<std::mutex> lock(_drawMutex);
             for (auto& [key, val] : val0)
             {
                 val.captureInfo |= CaptureInfo::DrawInstanced;
@@ -1434,7 +1434,6 @@ void ResTrack_Dx12::hkDrawInstanced(ID3D12GraphicsCommandList* This, UINT Vertex
             if (Config::Instance()->FGHudfixDisableDI.value_or_default())
                 break;
 
-            std::lock_guard<std::mutex> lock(_drawMutex);
             for (auto& [key, val] : val0)
             {
                 val.captureInfo |= CaptureInfo::DrawInstanced;
@@ -1493,7 +1492,6 @@ void ResTrack_Dx12::hkDrawIndexedInstanced(ID3D12GraphicsCommandList* This, UINT
             if (Config::Instance()->FGHudfixDisableDII.value_or_default())
                 break;
 
-            std::lock_guard<std::mutex> lock(_drawMutex);
             for (auto& [key, val] : val0)
             {
                 val.captureInfo |= CaptureInfo::DrawIndexedInstanced;
@@ -1544,10 +1542,8 @@ void ResTrack_Dx12::hkDrawIndexedInstanced(ID3D12GraphicsCommandList* This, UINT
             if (Config::Instance()->FGHudfixDisableDII.value_or_default())
                 break;
 
-            std::lock_guard<std::mutex> lock(_drawMutex);
             for (auto& [key, val] : val0)
             {
-                // LOG_DEBUG("Waiting _drawMutex {:X}", (size_t)val.buffer);
                 val.captureInfo |= CaptureInfo::DrawIndexedInstanced;
 
                 if (Hudfix_Dx12::CheckForHudless(This, &val, val.state))
@@ -1675,7 +1671,6 @@ void ResTrack_Dx12::hkDispatch(ID3D12GraphicsCommandList* This, UINT ThreadGroup
             if (Config::Instance()->FGHudfixDisableDispatch.value_or_default())
                 break;
 
-            std::lock_guard<std::mutex> lock(_drawMutex);
             for (auto& [key, val] : val0)
             {
                 val.captureInfo |= CaptureInfo::Dispatch;
@@ -1726,10 +1721,8 @@ void ResTrack_Dx12::hkDispatch(ID3D12GraphicsCommandList* This, UINT ThreadGroup
             if (Config::Instance()->FGHudfixDisableDispatch.value_or_default())
                 break;
 
-            std::lock_guard<std::mutex> lock(_drawMutex);
             for (auto& [key, val] : val0)
             {
-                // LOG_DEBUG("Waiting _drawMutex {:X}", (size_t)val.buffer);
                 val.captureInfo |= CaptureInfo::Dispatch;
                 if (Hudfix_Dx12::CheckForHudless(This, &val, val.state))
                 {
