@@ -135,11 +135,8 @@ struct TrackedResourceSlot
 };
 
 inline ankerl::unordered_dense::map<ID3D12Resource*, std::vector<TrackedResourceSlot>> _trackedResources;
-#ifdef USE_SPINLOCK_MUTEX
-inline SpinLock _trackedResourcesMutex;
-#else
 inline std::mutex _trackedResourcesMutex;
-#endif
+inline std::mutex _resourceLifetimeMutex;
 
 // Smaller info for descriptor tracking
 struct DescriptorResourceInfo
@@ -170,6 +167,7 @@ struct DescriptorResourceInfo
         target.format = format;
         target.flags = flags;
         target.type = type;
+        target.lifetimeTracked = true;
     }
 };
 
@@ -249,8 +247,6 @@ struct HeapInfo : public std::enable_shared_from_this<HeapInfo>
         vec.erase(std::remove_if(vec.begin(), vec.end(), [currentVersion, index](const TrackedResourceSlot& slot)
                                  { return slot.heapVersion == currentVersion && slot.index == index; }),
                   vec.end());
-        if (vec.empty())
-            _trackedResources.erase(it);
     }
 
     void AttachToNewResourceLocked(UINT index)
@@ -264,7 +260,14 @@ struct HeapInfo : public std::enable_shared_from_this<HeapInfo>
                   (size_t) newResource, info[index].width, info[index].height, (UINT) info[index].format);
 
         const auto currentVersion = version.load(std::memory_order_relaxed);
-        auto& vec = _trackedResources[newResource];
+        auto it = _trackedResources.find(newResource);
+        if (it == _trackedResources.end())
+        {
+            info[index].buffer = nullptr;
+            return;
+        }
+
+        auto& vec = it->second;
         auto found = std::find_if(vec.begin(), vec.end(), [currentVersion, index](const TrackedResourceSlot& slot)
                                   { return slot.heapVersion == currentVersion && slot.index == index; });
 
@@ -442,8 +445,6 @@ struct HeapInfo : public std::enable_shared_from_this<HeapInfo>
                                          [currentVersion, index](const TrackedResourceSlot& slot)
                                          { return slot.heapVersion == currentVersion && slot.index == index; }),
                           vec.end());
-                if (vec.empty())
-                    _trackedResources.erase(it);
             }
 
             info[index].buffer = nullptr;
@@ -557,10 +558,9 @@ class ResTrack_Dx12
     static HRESULT hkCreateDescriptorHeap(ID3D12Device* This, D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc,
                                           REFIID riid, void** ppvHeap);
 
-    static ULONG hkRelease(ID3D12Resource* This);
+    static void __stdcall ResourceDestroyed(void* data);
 
     static void HookCommandList(ID3D12Device* InDevice);
-    static void HookResource(ID3D12Device* InDevice);
 
     static bool CheckResource(ID3D12Resource* resource, ResourceInfo* outInfo = nullptr);
 
@@ -598,4 +598,5 @@ class ResTrack_Dx12
     static void ReleaseHooks();
     static void ReleaseDeviceHooks();
     static void ClearPossibleHudless();
+    static bool TrackResourceRelease(ID3D12Resource* resource);
 };
