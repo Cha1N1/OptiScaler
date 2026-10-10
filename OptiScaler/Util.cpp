@@ -370,6 +370,21 @@ std::filesystem::path Util::ExePath()
     return exe;
 }
 
+std::filesystem::path Util::ReShadePath()
+{
+    const auto exeDir = ExePath().parent_path();
+    const auto preferredPath = exeDir / L"d3d12-ReShade64.dll";
+    std::error_code ec;
+
+    // ReShade recognizes the d3d prefix and skips automatic OpenGL hooks.
+    // This avoids WGL context creation recursion under Wine/Proton.
+    if (std::filesystem::is_regular_file(preferredPath, ec))
+        return preferredPath;
+
+    // Keep existing installations working when the preferred DLL is absent.
+    return exeDir / L"ReShade64.dll";
+}
+
 static BOOL CALLBACK EnumWindowsCallback(HWND handle, LPARAM lParam)
 {
     const auto isMainWindow = [handle]()

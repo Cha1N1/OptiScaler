@@ -1140,7 +1140,7 @@ static void CheckWorkingMode()
     if (reshadeModule == nullptr && Config::Instance()->LoadReShade.value_or_default() &&
         !Config::Instance()->CreateD3D12DeviceForLuma.value_or_default())
     {
-        auto rsFile = Util::ExePath().parent_path() / L"ReShade64.dll";
+        auto rsFile = Util::ReShadePath();
         SetEnvironmentVariableW(L"RESHADE_DISABLE_LOADING_CHECK", L"1");
 
         if (skModule != nullptr)
@@ -1150,7 +1150,7 @@ static void CheckWorkingMode()
         reshadeModule = NtdllProxy::LoadLibraryExW_Ldr(rsFile.c_str(), NULL, 0);
         State::DisableServeOriginal(201);
 
-        LOG_INFO("Loading ReShade64.dll, result: {0:X}", (size_t) reshadeModule);
+        LOG_INFO("Loading {0}, result: {1:X}", rsFile.filename().string(), (size_t) reshadeModule);
     }
 
     // Version check
