@@ -30,7 +30,6 @@ struct Luid
 };
 
 std::filesystem::path ExePath();
-std::filesystem::path ReShadePath();
 std::filesystem::path DllPath();
 std::optional<std::filesystem::path> NvngxPath();
 
