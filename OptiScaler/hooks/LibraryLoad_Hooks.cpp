@@ -12,6 +12,7 @@
 #include <proxies/XeSS_Proxy.h>
 #include <proxies/XeFG_Proxy.h>
 #include <proxies/XeLL_Proxy.h>
+#include <inputs/FG/XeFG_Inputs_Dx12.h>
 #include <proxies/NVNGX_Proxy.h>
 #include <proxies/FfxApi_Proxy.h>
 
@@ -460,6 +461,14 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
         if (module != nullptr)
             XeSSProxy::InitXeSS(module);
 
+        return module;
+    }
+
+    // Also the game's own XeFG, for its XeLL context
+    if (CheckDllNameW(&libName, &xefgNamesW))
+    {
+        auto module = NtdllProxy::LoadLibraryExW_Ldr(lpLibFullPath, NULL, 0);
+        XeFGInputs::Hook(module);
         return module;
     }
 
@@ -971,12 +980,32 @@ HMODULE LibraryLoadHooks::LoadNvngxDlss(std::wstring originalPath)
 
 void LibraryLoadHooks::CheckModulesInMemory()
 {
+    const auto isLocalStreamlineModule = [](HMODULE module) -> bool
+    {
+        if (module == nullptr)
+            return false;
+
+        char modulePath[MAX_PATH] = {};
+        if (GetModuleFileNameA(module, modulePath, sizeof(modulePath)) == 0)
+            return false;
+
+        const auto path = std::filesystem::path(modulePath).lexically_normal();
+        const std::filesystem::path localSlPath =
+            std::filesystem::path(Config::Instance()->MainDllPath.value()) / L"streamline";
+        return Util::IsSubpath(path, localSlPath.lexically_normal());
+    };
+
     if (!StreamlineHooks::isInterposerHooked())
     {
         // hook streamline right away if it's already loaded
         HMODULE slModule = nullptr;
         slModule = GetDllNameWModule(&slInterposerNamesW);
-        if (slModule != nullptr && slModule != State::Instance().optiSlInterposer)
+
+        const bool gameInterposer =
+            slModule != nullptr && slModule != State::Instance().optiSlInterposer &&
+            (!isLocalStreamlineModule(slModule) || State::Instance().activeFgInput == FGInput::NvngxFG);
+
+        if (gameInterposer)
         {
             LOG_DEBUG("sl.interposer.dll already in memory");
             StreamlineHooks::hookInterposer(slModule);
@@ -997,21 +1026,6 @@ void LibraryLoadHooks::CheckModulesInMemory()
             }
         }
     }
-
-    const auto isLocalStreamlineModule = [](HMODULE module) -> bool
-    {
-        if (module == nullptr)
-            return false;
-
-        char modulePath[MAX_PATH] = {};
-        if (GetModuleFileNameA(module, modulePath, sizeof(modulePath)) == 0)
-            return false;
-
-        const auto path = std::filesystem::path(modulePath).lexically_normal();
-        const std::filesystem::path localSlPath =
-            std::filesystem::path(Config::Instance()->MainDllPath.value()) / L"streamline";
-        return Util::IsSubpath(path, localSlPath.lexically_normal());
-    };
 
     // DLSS-G
     {
