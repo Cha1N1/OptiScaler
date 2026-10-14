@@ -162,6 +162,19 @@ static std::vector<std::string> splashText = { "Cope smarter, not harder",
                                                "Nitec's Bizarre Upscaling",
                                                "\"Framegen really attracts some strange clientelle\"",
                                                "How to remove those corny messages?!",
+                                               "I don't even know what I'm doing here",
+                                               "Stop tweaking settings and play already",
+                                               "Oh great, another potato PC",
+                                               "XeFG is King but who's the Queen?",
+                                               "Native resolution? You must be joking",
+                                               "Enjoy your fake frames",
+                                               "Don't read this",
+                                               "You know I can see your GPU?",
+                                               "Frame gen will be working overtime in this one",
+                                               "Hi",
+                                               "Good to see you",
+                                               "How are you doing?",
+                                               "If the game crashes then it's NOT our fault",
                                                "<Your funny text goes here>" };
 
 static std::string updateNoticeTag;
@@ -3468,10 +3481,9 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
 
     // OptiFG requirements
     auto constexpr optiFgIndex = (uint32_t) FGInput::Upscaler;
-    inputOptions[optiFgIndex].set_disabled(state.swapchainApi == API::Vulkan, "Unsupported API");
-
-    if (!inputOptions[optiFgIndex].disabled && state.activeFgOutput == FGOutput::FSRFG && !FfxApiProxy::IsFGReady() &&
-        !ffxInitTried)
+    // FSR FG's Vulkan dll is loaded with the device
+    if (state.swapchainApi != API::Vulkan && !inputOptions[optiFgIndex].disabled &&
+        state.activeFgOutput == FGOutput::FSRFG && !FfxApiProxy::IsFGReady() && !ffxInitTried)
     {
         ffxInitTried = true;
         FfxApiProxy::InitFfxDx12();
@@ -4097,8 +4109,8 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
     if (ScopedCard::Shows("fg_fsrfg") && state.activeFgOutput == FGOutput::FSRFG &&
         state.activeFgInput != FGInput::NoFG && state.FGSwapchainExists())
     {
-        if (state.activeFgInput != FGInput::Upscaler ||
-            (currentFeature != nullptr && !currentFeature->IsFrozen()) && FfxApiProxy::IsFGReady())
+        if (state.activeFgInput != FGInput::Upscaler || (currentFeature != nullptr && !currentFeature->IsFrozen()) &&
+                                                            (state.currentVkFG != nullptr || FfxApiProxy::IsFGReady()))
         {
             ScopedCard card { "FSR FG Settings" };
 
