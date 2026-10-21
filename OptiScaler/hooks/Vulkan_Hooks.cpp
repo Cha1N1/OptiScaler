@@ -13,6 +13,7 @@
 #include <framegen/ffx/FSRFG_Vk.h>
 #include <framegen/dlssg/DLSSG_Vk.h>
 #include <framegen/reprojection/Reprojection_Vk.h>
+#include <fsr4/FSR4DriverProviderVk.h>
 
 #include <misc/FrameLimit.h>
 #include <misc/DeferredRelease.h>
@@ -22,6 +23,8 @@
 #include <hudfix/Hudfix_Vk.h>
 
 #include <vulkan/vulkan.h>
+
+#include <unordered_map>
 
 #include <detours/detours.h>
 #include <misc/IdentifyGpu.h>
@@ -40,6 +43,10 @@ static VkInstance _instance = VK_NULL_HANDLE;
 static VkPhysicalDevice _PD = VK_NULL_HANDLE;
 static HWND _hwnd = nullptr;
 
+static std::mutex _vkApiVersionMutex;
+static std::unordered_map<VkInstance, uint32_t> _instanceApiVersions;
+static std::unordered_map<VkPhysicalDevice, VkInstance> _physicalDeviceInstances;
+
 static std::mutex _surfaceWindowsMutex;
 static std::unordered_map<VkSurfaceKHR, HWND> _surfaceWindows;
 
@@ -48,14 +55,20 @@ static std::mutex _vkPresentMutex;
 PFN_vkCreateDevice o_vkCreateDevice = nullptr;
 PFN_vkCreateInstance o_vkCreateInstance = nullptr;
 PFN_vkCreateWin32SurfaceKHR o_vkCreateWin32SurfaceKHR = nullptr;
+static PFN_vkDestroyInstance o_vkDestroyInstance = nullptr;
 PFN_vkQueuePresentKHR o_QueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR o_CreateSwapchainKHR = nullptr;
 static PFN_vkDestroySwapchainKHR o_DestroySwapchainKHR = nullptr;
 static PFN_vkGetSwapchainImagesKHR o_GetSwapchainImagesKHR = nullptr;
 static PFN_vkAcquireNextImageKHR o_AcquireNextImageKHR = nullptr;
 static PFN_vkSetHdrMetadataEXT o_SetHdrMetadataEXT = nullptr;
+static PFN_vkWaitForPresentKHR o_WaitForPresentKHR = nullptr;
+static PFN_vkWaitForPresent2KHR o_WaitForPresent2KHR = nullptr;
 static PFN_vkGetInstanceProcAddr o_vkGetInstanceProcAddr = nullptr;
 static PFN_vkGetDeviceProcAddr o_vkGetDeviceProcAddr = nullptr;
+static PFN_vkEnumeratePhysicalDevices o_vkEnumeratePhysicalDevices = nullptr;
+static PFN_vkEnumeratePhysicalDeviceGroups o_vkEnumeratePhysicalDeviceGroups = nullptr;
+static PFN_vkEnumeratePhysicalDeviceGroupsKHR o_vkEnumeratePhysicalDeviceGroupsKHR = nullptr;
 
 // Those aren't hooked, just grabbed for use
 static PFN_vkGetPhysicalDeviceFeatures2 o_vkGetPhysicalDeviceFeatures2 = nullptr;
@@ -126,44 +139,6 @@ static bool TimelineSemaphoresEnabled(const VkDeviceCreateInfo* pCreateInfo)
     return false;
 }
 
-// The FG outputs sync with timeline semaphores, turns them on when the game didn't. Spoofing adds their extension.
-// `added` gets chained into createInfo when the game has no feature struct for them, it has to outlive vkCreateDevice.
-static bool EnableTimelineSemaphores(VkPhysicalDevice physicalDevice, VkDeviceCreateInfo& createInfo,
-                                     VkPhysicalDeviceTimelineSemaphoreFeatures& added)
-{
-    if (TimelineSemaphoresEnabled(&createInfo))
-        return true;
-
-    VkPhysicalDeviceTimelineSemaphoreFeatures supported {
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES
-    };
-    VkPhysicalDeviceFeatures2 features { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &supported };
-    vkGetPhysicalDeviceFeatures2(physicalDevice, &features);
-
-    if (!supported.timelineSemaphore)
-        return false;
-
-    // A feature struct of the game already listing it as off, otherwise a new one
-    for (auto next = (VkBaseOutStructure*) createInfo.pNext; next != nullptr; next = next->pNext)
-    {
-        if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
-        {
-            ((VkPhysicalDeviceVulkan12Features*) next)->timelineSemaphore = VK_TRUE;
-            return true;
-        }
-
-        if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES)
-        {
-            ((VkPhysicalDeviceTimelineSemaphoreFeatures*) next)->timelineSemaphore = VK_TRUE;
-            return true;
-        }
-    }
-
-    added = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, (void*) createInfo.pNext, VK_TRUE };
-    createInfo.pNext = &added;
-    return true;
-}
-
 // Forward declaration
 static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
 static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
@@ -175,6 +150,9 @@ static VkResult hkvkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchai
                                         VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex);
 static void hkvkSetHdrMetadataEXT(VkDevice device, uint32_t swapchainCount, const VkSwapchainKHR* pSwapchains,
                                   const VkHdrMetadataEXT* pMetadata);
+static VkResult hkvkWaitForPresentKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t presentId, uint64_t timeout);
+static VkResult hkvkWaitForPresent2KHR(VkDevice device, VkSwapchainKHR swapchain,
+                                       const VkPresentWait2InfoKHR* pPresentWait2Info);
 
 // Swapchain calls coming from dxvk/vkd3d-proton's DXGI based modules
 // For those the menu is drawn on the DXGI swapchain instead
@@ -246,6 +224,23 @@ static PFN_vkVoidFunction LowLatencyInputHook(const char* pName, PFN_vkVoidFunct
     return nullptr;
 }
 
+static bool EnableRadvCooperativeMatrix2()
+{
+    using PFN_wine_set_unix_env = LONG(WINAPI*)(const char*, const char*);
+
+    const auto getModuleHandleW = KernelBaseProxy::GetModuleHandleW_();
+    const auto getProcAddress = KernelBaseProxy::GetProcAddress_();
+    if (!getModuleHandleW || !getProcAddress)
+        return false;
+
+    const auto ntdll = getModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return false;
+
+    const auto setUnixEnv = reinterpret_cast<PFN_wine_set_unix_env>(getProcAddress(ntdll, "__wine_set_unix_env"));
+    return setUnixEnv && setUnixEnv("radv_cooperative_matrix2_nv", "true") >= 0;
+}
+
 static void HookDevice(VkDevice InDevice)
 {
     if (o_CreateSwapchainKHR != nullptr || State::Instance().vulkanSkipHooks)
@@ -259,6 +254,8 @@ static void HookDevice(VkDevice InDevice)
     o_GetSwapchainImagesKHR = (PFN_vkGetSwapchainImagesKHR) (vkGetDeviceProcAddr(InDevice, "vkGetSwapchainImagesKHR"));
     o_AcquireNextImageKHR = (PFN_vkAcquireNextImageKHR) (vkGetDeviceProcAddr(InDevice, "vkAcquireNextImageKHR"));
     o_SetHdrMetadataEXT = (PFN_vkSetHdrMetadataEXT) (vkGetDeviceProcAddr(InDevice, "vkSetHdrMetadataEXT"));
+    o_WaitForPresentKHR = (PFN_vkWaitForPresentKHR) (vkGetDeviceProcAddr(InDevice, "vkWaitForPresentKHR"));
+    o_WaitForPresent2KHR = (PFN_vkWaitForPresent2KHR) (vkGetDeviceProcAddr(InDevice, "vkWaitForPresent2KHR"));
 
     if (o_CreateSwapchainKHR)
     {
@@ -286,6 +283,12 @@ static void HookDevice(VkDevice InDevice)
         if (o_SetHdrMetadataEXT != nullptr)
             DetourAttach(&(PVOID&) o_SetHdrMetadataEXT, hkvkSetHdrMetadataEXT);
 
+        if (o_WaitForPresentKHR != nullptr)
+            DetourAttach(&(PVOID&) o_WaitForPresentKHR, hkvkWaitForPresentKHR);
+
+        if (o_WaitForPresent2KHR != nullptr)
+            DetourAttach(&(PVOID&) o_WaitForPresent2KHR, hkvkWaitForPresent2KHR);
+
         auto detourResult = DetourTransactionCommit();
         if (detourResult != NO_ERROR)
         {
@@ -296,6 +299,8 @@ static void HookDevice(VkDevice InDevice)
             o_GetSwapchainImagesKHR = nullptr;
             o_AcquireNextImageKHR = nullptr;
             o_SetHdrMetadataEXT = nullptr;
+            o_WaitForPresentKHR = nullptr;
+            o_WaitForPresent2KHR = nullptr;
         }
     }
 }
@@ -312,7 +317,11 @@ static IFGFeature_Vk* CreateFGFeature()
 
     if (state.activeFgOutput == FGOutput::FSRFG)
     {
-        if (FfxApiProxy::InitFfxVk())
+        // Driver provided ML FG works without amd_fidelityfx_vk.dll
+        bool sdkLoaded = FfxApiProxy::InitFfxVk();
+        bool driverLoaded = FSR4DriverProviderVk::InitFg();
+
+        if (sdkLoaded || driverLoaded)
             state.currentVkFG = new FSRFG_Vk();
         else
             LOG_ERROR("Can't load amd_fidelityfx_vk.dll, FSR FG won't be available");
@@ -357,16 +366,122 @@ static VkResult hkvkCreateWin32SurfaceKHR(VkInstance instance, const VkWin32Surf
 
     if (result == VK_SUCCESS && !State::Instance().vulkanSkipHooks)
     {
-        MenuOverlayVk::DestroyVulkanObjects(false);
-
         _instance = instance;
         State::Instance().VulkanInstance = instance;
         LOG_DEBUG("_instance captured: {0:X}", (UINT64) _instance);
-        _hwnd = pCreateInfo->hwnd;
-        LOG_DEBUG("_hwnd captured: {0:X}", (UINT64) _hwnd);
+
+        if (!MenuOverlayVk::OnOtherWindow(pCreateInfo->hwnd))
+        {
+            MenuOverlayVk::DestroyVulkanObjects(false);
+
+            _hwnd = pCreateInfo->hwnd;
+            LOG_DEBUG("_hwnd captured: {0:X}", (UINT64) _hwnd);
+        }
     }
 
     LOG_FUNC_RESULT(result);
+
+    return result;
+}
+
+static void TrackPhysicalDevice(VkInstance instance, VkPhysicalDevice physicalDevice)
+{
+    if (physicalDevice == VK_NULL_HANDLE)
+        return;
+
+    std::scoped_lock lock(_vkApiVersionMutex);
+    _physicalDeviceInstances[physicalDevice] = instance;
+}
+
+static uint32_t GetPhysicalDeviceApiVersion(VkPhysicalDevice physicalDevice, VkInstance* instance = nullptr)
+{
+    if (instance != nullptr)
+        *instance = VK_NULL_HANDLE;
+
+    std::scoped_lock lock(_vkApiVersionMutex);
+
+    const auto physicalDeviceIt = _physicalDeviceInstances.find(physicalDevice);
+    if (physicalDeviceIt != _physicalDeviceInstances.end())
+    {
+        if (instance != nullptr)
+            *instance = physicalDeviceIt->second;
+
+        const auto instanceIt = _instanceApiVersions.find(physicalDeviceIt->second);
+        if (instanceIt != _instanceApiVersions.end())
+            return instanceIt->second;
+    }
+
+    LOG_WARN("No Vulkan instance API version tracked for VkPhysicalDevice {0:X}; API version is unknown",
+             (UINT64) physicalDevice);
+
+    return 0;
+}
+
+static void UntrackInstance(VkInstance instance)
+{
+    std::scoped_lock lock(_vkApiVersionMutex);
+    _instanceApiVersions.erase(instance);
+
+    for (auto it = _physicalDeviceInstances.begin(); it != _physicalDeviceInstances.end();)
+    {
+        if (it->second == instance)
+            it = _physicalDeviceInstances.erase(it);
+        else
+            ++it;
+    }
+}
+
+VALIDATE_HOOK(hkvkEnumeratePhysicalDevices, PFN_vkEnumeratePhysicalDevices)
+static VkResult hkvkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhysicalDeviceCount,
+                                             VkPhysicalDevice* pPhysicalDevices)
+{
+    const auto result = o_vkEnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices);
+
+    if ((result == VK_SUCCESS || result == VK_INCOMPLETE) && pPhysicalDeviceCount != nullptr &&
+        pPhysicalDevices != nullptr)
+    {
+        for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i)
+            TrackPhysicalDevice(instance, pPhysicalDevices[i]);
+    }
+
+    return result;
+}
+
+static void TrackPhysicalDeviceGroups(VkInstance instance, uint32_t groupCount,
+                                      const VkPhysicalDeviceGroupProperties* groups)
+{
+    for (uint32_t groupIndex = 0; groupIndex < groupCount; ++groupIndex)
+    {
+        const auto& group = groups[groupIndex];
+        for (uint32_t deviceIndex = 0; deviceIndex < group.physicalDeviceCount; ++deviceIndex)
+            TrackPhysicalDevice(instance, group.physicalDevices[deviceIndex]);
+    }
+}
+
+VALIDATE_HOOK(hkvkEnumeratePhysicalDeviceGroups, PFN_vkEnumeratePhysicalDeviceGroups)
+static VkResult hkvkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* pPhysicalDeviceGroupCount,
+                                                  VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties)
+{
+    const auto result =
+        o_vkEnumeratePhysicalDeviceGroups(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+
+    if ((result == VK_SUCCESS || result == VK_INCOMPLETE) && pPhysicalDeviceGroupCount != nullptr &&
+        pPhysicalDeviceGroupProperties != nullptr)
+        TrackPhysicalDeviceGroups(instance, *pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+
+    return result;
+}
+
+VALIDATE_HOOK(hkvkEnumeratePhysicalDeviceGroupsKHR, PFN_vkEnumeratePhysicalDeviceGroupsKHR)
+static VkResult hkvkEnumeratePhysicalDeviceGroupsKHR(VkInstance instance, uint32_t* pPhysicalDeviceGroupCount,
+                                                     VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties)
+{
+    const auto result =
+        o_vkEnumeratePhysicalDeviceGroupsKHR(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+
+    if ((result == VK_SUCCESS || result == VK_INCOMPLETE) && pPhysicalDeviceGroupCount != nullptr &&
+        pPhysicalDeviceGroupProperties != nullptr)
+        TrackPhysicalDeviceGroups(instance, *pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
 
     return result;
 }
@@ -379,6 +494,21 @@ static VkResult hkvkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
 
     VkInstanceCreateInfo localCreateInfo {};
     memcpy(&localCreateInfo, pCreateInfo, sizeof(VkInstanceCreateInfo));
+
+    const uint32_t requestedApiVersion =
+        pCreateInfo->pApplicationInfo != nullptr && pCreateInfo->pApplicationInfo->apiVersion != 0
+            ? pCreateInfo->pApplicationInfo->apiVersion
+            : VK_API_VERSION_1_0;
+
+    if (State::Instance().isRunningOnLinux && !State::Instance().vulkanSkipHooks &&
+        !State::Instance().creatingD3DDevice)
+    {
+        static const bool radvCooperativeMatrix2Enabled = EnableRadvCooperativeMatrix2();
+        if (radvCooperativeMatrix2Enabled)
+        {
+            LOG_INFO("Enabled RADV cooperative matrix 2 support");
+        }
+    }
 
     VulkanSpoofing::hkvkCreateInstance(&localCreateInfo, pAllocator, pInstance);
 
@@ -411,6 +541,11 @@ static VkResult hkvkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
     // OptiScaler's own Streamline only makes short lived ones
     if (result == VK_SUCCESS && !StreamlineProxy::IsInitializing())
     {
+        {
+            std::scoped_lock lock(_vkApiVersionMutex);
+            _instanceApiVersions[*pInstance] = requestedApiVersion;
+        }
+
         State::Instance().VulkanInstance = *pInstance;
         LOG_DEBUG("State::Instance().VulkanInstance captured: {0:X}", (UINT64) State::Instance().VulkanInstance);
 
@@ -434,14 +569,37 @@ static VkResult hkvkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
     return result;
 }
 
+VALIDATE_HOOK(hkvkDestroyInstance, PFN_vkDestroyInstance)
+static void hkvkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator)
+{
+    UntrackInstance(instance);
+    o_vkDestroyInstance(instance, pAllocator);
+}
+
 VALIDATE_HOOK(hkvkCreateDevice, PFN_vkCreateDevice)
 static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo,
                                  const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
 {
     LOG_FUNC();
 
-    VkDeviceCreateInfo localCreteInfo {};
-    memcpy(&localCreteInfo, pCreateInfo, sizeof(VkDeviceCreateInfo));
+    VkDeviceCreateInfo localCreateInfo {};
+    memcpy(&localCreateInfo, pCreateInfo, sizeof(VkDeviceCreateInfo));
+
+    VkInstance physicalDeviceInstance = VK_NULL_HANDLE;
+    const uint32_t requestedApiVersion = GetPhysicalDeviceApiVersion(physicalDevice, &physicalDeviceInstance);
+
+    PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2 = o_vkGetPhysicalDeviceFeatures2;
+
+    if (requestedApiVersion < VK_API_VERSION_1_1)
+    {
+        getPhysicalDeviceFeatures2 = nullptr;
+
+        if (physicalDeviceInstance != VK_NULL_HANDLE && o_vkGetInstanceProcAddr != nullptr)
+        {
+            getPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                o_vkGetInstanceProcAddr(physicalDeviceInstance, "vkGetPhysicalDeviceFeatures2KHR"));
+        }
+    }
 
     // Check support for AntiLag before spoof
     VkPhysicalDeviceFeatures2 features2 = {};
@@ -452,22 +610,23 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     features2.pNext = &antiLagFeatures;
 
-    if (o_vkGetPhysicalDeviceFeatures2)
+    if (getPhysicalDeviceFeatures2)
     {
-        o_vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+        getPhysicalDeviceFeatures2(physicalDevice, &features2);
         State::Instance().vkAntiLagSupported = antiLagFeatures.antiLag != 0;
     }
 
     IFGFeature_Vk* fg = nullptr;
-    VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphoreFeatures {};
+    VulkanDeviceFeatureState fgFeatures(&localCreateInfo, getPhysicalDeviceFeatures2);
 
     // Before spoofing, which drops the extensions it only pretends to have
     if (!State::Instance().vulkanSkipHooks && !State::Instance().creatingD3DDevice &&
-        !IsDxgiBackedCaller(_ReturnAddress()) && (fg = CreateFGFeature()) != nullptr)
+        getPhysicalDeviceFeatures2 != nullptr && !IsDxgiBackedCaller(_ReturnAddress()) &&
+        (fg = CreateFGFeature()) != nullptr)
     {
-        if (EnableTimelineSemaphores(physicalDevice, localCreteInfo, timelineSemaphoreFeatures))
+        if (fgFeatures.EnableTimelineSemaphores(physicalDevice))
         {
-            fg->PrepareDevice(physicalDevice, localCreteInfo);
+            fg->PrepareDevice(physicalDevice, localCreateInfo);
         }
         else
         {
@@ -476,9 +635,22 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         }
     }
 
-    VulkanSpoofing::hkvkCreateDevice(physicalDevice, &localCreteInfo, pAllocator, pDevice);
+    VkResult result;
+    bool timelineSemaphoresEnabled = false;
+    {
+        VulkanDeviceFeatureState deviceFeatures(&localCreateInfo, getPhysicalDeviceFeatures2);
+        VulkanDeviceFeatureState* featureState = nullptr;
+        if (!State::Instance().vulkanSkipHooks && !State::Instance().creatingD3DDevice &&
+            getPhysicalDeviceFeatures2 != nullptr)
+            featureState = &deviceFeatures;
 
-    auto result = o_vkCreateDevice(physicalDevice, &localCreteInfo, pAllocator, pDevice);
+        VulkanSpoofing::hkvkCreateDevice(physicalDevice, &localCreateInfo, pAllocator, pDevice, featureState,
+                                         requestedApiVersion);
+
+        timelineSemaphoresEnabled = TimelineSemaphoresEnabled(&localCreateInfo);
+
+        result = o_vkCreateDevice(physicalDevice, &localCreateInfo, pAllocator, pDevice);
+    }
 
     if (result == VK_SUCCESS)
         DeferredRelease::DropOwnersExcept((uint64_t) *pDevice);
@@ -502,7 +674,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
             _device = *pDevice;
             LOG_DEBUG("_device captured: {0:X}", (UINT64) _device);
             HookDevice(_device);
-            MenuOverlayVk::DeviceCreated(_device, &localCreteInfo);
+            MenuOverlayVk::DeviceCreated(_device, &localCreateInfo);
         }
 
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
@@ -541,7 +713,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     // The driver's VK_NV_low_latency2, only there when the device has it enabled
     if (result == VK_SUCCESS && o_vkGetDeviceProcAddr && !State::Instance().vulkanSkipHooks &&
-        !State::Instance().creatingD3DDevice && TimelineSemaphoresEnabled(&localCreteInfo))
+        !State::Instance().creatingD3DDevice && timelineSemaphoresEnabled)
     {
         auto getProc = [&](const char* name) { return o_vkGetDeviceProcAddr(*pDevice, name); };
 
@@ -777,7 +949,9 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
         _device = device;
         LOG_DEBUG("_device captured: {0:X}", (UINT64) _device);
 
-        MenuOverlayVk::CreateSwapchain(device, _PD, _instance, _hwnd, pCreateInfo, pAllocator, pSwapchain);
+        auto hwnd = VulkanHooks::SurfaceWindow(pCreateInfo->surface);
+        MenuOverlayVk::CreateSwapchain(device, _PD, _instance, hwnd != nullptr ? hwnd : _hwnd, pCreateInfo, pAllocator,
+                                       pSwapchain);
     }
 
     LOG_FUNC_RESULT(result);
@@ -858,6 +1032,33 @@ static void hkvkSetHdrMetadataEXT(VkDevice device, uint32_t swapchainCount, cons
     }
 }
 
+// The FG output's swapchain isn't a driver one and the game's present ids don't reach the real presents,
+// the output paces the presents itself
+VALIDATE_HOOK(hkvkWaitForPresentKHR, PFN_vkWaitForPresentKHR)
+static VkResult hkvkWaitForPresentKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t presentId, uint64_t timeout)
+{
+    if (auto fg = State::Instance().currentVkFG;
+        fg != nullptr && fg->OwnsSwapchain(swapchain) && !FromFGOutput(_ReturnAddress()))
+    {
+        return VK_SUCCESS;
+    }
+
+    return o_WaitForPresentKHR(device, swapchain, presentId, timeout);
+}
+
+VALIDATE_HOOK(hkvkWaitForPresent2KHR, PFN_vkWaitForPresent2KHR)
+static VkResult hkvkWaitForPresent2KHR(VkDevice device, VkSwapchainKHR swapchain,
+                                       const VkPresentWait2InfoKHR* pPresentWait2Info)
+{
+    if (auto fg = State::Instance().currentVkFG;
+        fg != nullptr && fg->OwnsSwapchain(swapchain) && !FromFGOutput(_ReturnAddress()))
+    {
+        return VK_SUCCESS;
+    }
+
+    return o_WaitForPresent2KHR(device, swapchain, pPresentWait2Info);
+}
+
 VALIDATE_HOOK(hkvkGetInstanceProcAddr, PFN_vkGetInstanceProcAddr)
 PFN_vkVoidFunction hkvkGetInstanceProcAddr(VkInstance instance, const char* pName)
 {
@@ -875,6 +1076,34 @@ PFN_vkVoidFunction hkvkGetInstanceProcAddr(VkInstance instance, const char* pNam
 
         LOG_DEBUG("vkCreateInstance");
         return (PFN_vkVoidFunction) hkvkCreateInstance;
+    }
+    else if (procName == std::string("vkDestroyInstance"))
+    {
+        if (o_vkDestroyInstance == nullptr)
+            o_vkDestroyInstance = (PFN_vkDestroyInstance) orgFunc;
+
+        return (PFN_vkVoidFunction) hkvkDestroyInstance;
+    }
+    else if (procName == std::string("vkEnumeratePhysicalDevices"))
+    {
+        if (o_vkEnumeratePhysicalDevices == nullptr)
+            o_vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices) orgFunc;
+
+        return (PFN_vkVoidFunction) hkvkEnumeratePhysicalDevices;
+    }
+    else if (procName == std::string("vkEnumeratePhysicalDeviceGroups"))
+    {
+        if (o_vkEnumeratePhysicalDeviceGroups == nullptr)
+            o_vkEnumeratePhysicalDeviceGroups = (PFN_vkEnumeratePhysicalDeviceGroups) orgFunc;
+
+        return (PFN_vkVoidFunction) hkvkEnumeratePhysicalDeviceGroups;
+    }
+    else if (procName == std::string("vkEnumeratePhysicalDeviceGroupsKHR"))
+    {
+        if (o_vkEnumeratePhysicalDeviceGroupsKHR == nullptr)
+            o_vkEnumeratePhysicalDeviceGroupsKHR = (PFN_vkEnumeratePhysicalDeviceGroupsKHR) orgFunc;
+
+        return (PFN_vkVoidFunction) hkvkEnumeratePhysicalDeviceGroupsKHR;
     }
     else if (procName == std::string("vkCreateDevice"))
     {
@@ -1010,12 +1239,22 @@ void VulkanHooks::Hook(HMODULE vulkan1)
 
     o_vkCreateDevice = (PFN_vkCreateDevice) KernelBaseProxy::GetProcAddress_()(vulkan1, "vkCreateDevice");
     o_vkCreateInstance = (PFN_vkCreateInstance) KernelBaseProxy::GetProcAddress_()(vulkan1, "vkCreateInstance");
+    o_vkDestroyInstance = (PFN_vkDestroyInstance) KernelBaseProxy::GetProcAddress_()(vulkan1, "vkDestroyInstance");
 
     address = KernelBaseProxy::GetProcAddress_()(vulkan1, "vkGetInstanceProcAddr");
     o_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) address;
 
     address = KernelBaseProxy::GetProcAddress_()(vulkan1, "vkGetDeviceProcAddr");
     o_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr) address;
+
+    address = KernelBaseProxy::GetProcAddress_()(vulkan1, "vkEnumeratePhysicalDevices");
+    o_vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices) address;
+
+    address = KernelBaseProxy::GetProcAddress_()(vulkan1, "vkEnumeratePhysicalDeviceGroups");
+    o_vkEnumeratePhysicalDeviceGroups = (PFN_vkEnumeratePhysicalDeviceGroups) address;
+
+    address = KernelBaseProxy::GetProcAddress_()(vulkan1, "vkEnumeratePhysicalDeviceGroupsKHR");
+    o_vkEnumeratePhysicalDeviceGroupsKHR = (PFN_vkEnumeratePhysicalDeviceGroupsKHR) address;
 
     address = KernelBaseProxy::GetProcAddress_()(vulkan1, "vkCreateWin32SurfaceKHR");
     o_vkCreateWin32SurfaceKHR = (PFN_vkCreateWin32SurfaceKHR) address;
@@ -1044,8 +1283,20 @@ void VulkanHooks::Hook(HMODULE vulkan1)
     if (o_vkGetDeviceProcAddr != nullptr)
         DetourAttach(&(PVOID&) o_vkGetDeviceProcAddr, hkvkGetDeviceProcAddr);
 
+    if (o_vkEnumeratePhysicalDevices != nullptr)
+        DetourAttach(&(PVOID&) o_vkEnumeratePhysicalDevices, hkvkEnumeratePhysicalDevices);
+
+    if (o_vkEnumeratePhysicalDeviceGroups != nullptr)
+        DetourAttach(&(PVOID&) o_vkEnumeratePhysicalDeviceGroups, hkvkEnumeratePhysicalDeviceGroups);
+
+    if (o_vkEnumeratePhysicalDeviceGroupsKHR != nullptr)
+        DetourAttach(&(PVOID&) o_vkEnumeratePhysicalDeviceGroupsKHR, hkvkEnumeratePhysicalDeviceGroupsKHR);
+
     if (o_vkCreateInstance != nullptr)
         DetourAttach(&(PVOID&) o_vkCreateInstance, hkvkCreateInstance);
+
+    if (o_vkDestroyInstance != nullptr)
+        DetourAttach(&(PVOID&) o_vkDestroyInstance, hkvkDestroyInstance);
 
     if (o_vkCreateWin32SurfaceKHR != nullptr)
         DetourAttach(&(PVOID&) o_vkCreateWin32SurfaceKHR, hkvkCreateWin32SurfaceKHR);
@@ -1059,10 +1310,18 @@ void VulkanHooks::Hook(HMODULE vulkan1)
         LOG_ERROR("Failed to hook Vulkan, error code: {:X}", detourResult);
         o_vkCreateDevice = nullptr;
         o_vkCreateInstance = nullptr;
+        o_vkDestroyInstance = nullptr;
         o_vkGetInstanceProcAddr = nullptr;
         o_vkGetDeviceProcAddr = nullptr;
+        o_vkEnumeratePhysicalDevices = nullptr;
+        o_vkEnumeratePhysicalDeviceGroups = nullptr;
+        o_vkEnumeratePhysicalDeviceGroupsKHR = nullptr;
         o_vkCreateWin32SurfaceKHR = nullptr;
         // o_vkCmdPipelineBarrier = nullptr;
+
+        std::scoped_lock lock(_vkApiVersionMutex);
+        _instanceApiVersions.clear();
+        _physicalDeviceInstances.clear();
     }
 }
 
@@ -1089,11 +1348,29 @@ void VulkanHooks::Unhook()
     if (o_SetHdrMetadataEXT != nullptr)
         DetourDetach(&(PVOID&) o_SetHdrMetadataEXT, hkvkSetHdrMetadataEXT);
 
+    if (o_WaitForPresentKHR != nullptr)
+        DetourDetach(&(PVOID&) o_WaitForPresentKHR, hkvkWaitForPresentKHR);
+
+    if (o_WaitForPresent2KHR != nullptr)
+        DetourDetach(&(PVOID&) o_WaitForPresent2KHR, hkvkWaitForPresent2KHR);
+
     if (o_vkCreateDevice != nullptr)
         DetourDetach(&(PVOID&) o_vkCreateDevice, hkvkCreateDevice);
 
+    if (o_vkEnumeratePhysicalDevices != nullptr)
+        DetourDetach(&(PVOID&) o_vkEnumeratePhysicalDevices, hkvkEnumeratePhysicalDevices);
+
+    if (o_vkEnumeratePhysicalDeviceGroups != nullptr)
+        DetourDetach(&(PVOID&) o_vkEnumeratePhysicalDeviceGroups, hkvkEnumeratePhysicalDeviceGroups);
+
+    if (o_vkEnumeratePhysicalDeviceGroupsKHR != nullptr)
+        DetourDetach(&(PVOID&) o_vkEnumeratePhysicalDeviceGroupsKHR, hkvkEnumeratePhysicalDeviceGroupsKHR);
+
     if (o_vkCreateInstance != nullptr)
         DetourDetach(&(PVOID&) o_vkCreateInstance, hkvkCreateInstance);
+
+    if (o_vkDestroyInstance != nullptr)
+        DetourDetach(&(PVOID&) o_vkDestroyInstance, hkvkDestroyInstance);
 
     if (o_vkCreateWin32SurfaceKHR != nullptr)
         DetourDetach(&(PVOID&) o_vkCreateWin32SurfaceKHR, hkvkCreateWin32SurfaceKHR);
@@ -1114,11 +1391,21 @@ void VulkanHooks::Unhook()
         o_GetSwapchainImagesKHR = nullptr;
         o_AcquireNextImageKHR = nullptr;
         o_SetHdrMetadataEXT = nullptr;
+        o_WaitForPresentKHR = nullptr;
+        o_WaitForPresent2KHR = nullptr;
         o_vkCreateDevice = nullptr;
         o_vkCreateInstance = nullptr;
+        o_vkDestroyInstance = nullptr;
         o_vkGetInstanceProcAddr = nullptr;
         o_vkGetDeviceProcAddr = nullptr;
+        o_vkEnumeratePhysicalDevices = nullptr;
+        o_vkEnumeratePhysicalDeviceGroups = nullptr;
+        o_vkEnumeratePhysicalDeviceGroupsKHR = nullptr;
         o_vkCreateWin32SurfaceKHR = nullptr;
         // o_vkCmdPipelineBarrier = nullptr;
+
+        std::scoped_lock lock(_vkApiVersionMutex);
+        _instanceApiVersions.clear();
+        _physicalDeviceInstances.clear();
     }
 }
