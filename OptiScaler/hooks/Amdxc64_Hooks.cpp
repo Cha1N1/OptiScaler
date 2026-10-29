@@ -118,6 +118,13 @@ void Amdxc64Hooks::Init()
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"amdxc64.dll", &moduleAmdxc64);
 
         LOG_INFO("amdxc64.dll loaded");
+
+        static std::mutex initMutex;
+        std::scoped_lock lock(initMutex);
+
+        if (o_AmdExtD3DCreateInterface != nullptr)
+            return;
+
         o_AmdExtD3DCreateInterface = (PFN_AmdExtD3DCreateInterface) KernelBaseProxy::GetProcAddress_()(
             moduleAmdxc64, "AmdExtD3DCreateInterface");
 
@@ -298,6 +305,8 @@ ULONG STDMETHODCALLTYPE Amdxc64Hooks::hkFlipMeterRelease(IAmdExtFlipMeter* This)
     std::scoped_lock lock(flipMeterMutex);
 
     auto refCount = o_FlipMeterRelease(This);
+    LOG_DEBUG("IAmdExtFlipMeter {:X} refs left: {}, caller: {}", (size_t) This, refCount,
+              Util::WhoIsTheCaller(_ReturnAddress()));
 
     if (refCount == 0 && This == flipMeter)
     {
@@ -318,7 +327,8 @@ HRESULT STDMETHODCALLTYPE Amdxc64Hooks::hkFactoryCreateInterface(IAmdExtD3DFacto
 
     if (riid == __uuidof(IAmdExtFlipMeter))
     {
-        LOG_INFO("IAmdExtFlipMeter created for swapchain: {:X}, result: {:X}", (size_t) pOuter, (UINT) result);
+        LOG_INFO("IAmdExtFlipMeter created for swapchain: {:X}, result: {:X}, caller: {}", (size_t) pOuter,
+                 (UINT) result, Util::WhoIsTheCaller(_ReturnAddress()));
 
         if (SUCCEEDED(result) && *ppvObject != nullptr)
         {
