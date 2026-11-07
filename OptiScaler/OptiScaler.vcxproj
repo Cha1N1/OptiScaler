@@ -224,11 +224,13 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="framegen\IFGFeature_Dx12.h" />
     <ClInclude Include="framegen\IFGFeature_Vk.h" />
     <ClInclude Include="framegen\nvngx\Nvngx_FG.h" />
+    <ClInclude Include="framegen\nvngx\NvngxVkLayouts.h" />
     <ClInclude Include="fsr4\FSR4DriverProviderDx12.h" />
     <ClInclude Include="fsr4\FSR4Models.h" />
     <ClInclude Include="fsr4\FSR4Presets.h" />
     <ClInclude Include="fsr4\FSR4PipelineLayouts.h" />
     <ClInclude Include="hooks\D3D12_Hooks.h" />
+    <ClInclude Include="hooks\Sampler_Overrides.h" />
     <ClInclude Include="hooks\DxgiFactory_Hooks.h" />
     <ClInclude Include="hooks\DxgiFactory_WrappedCalls.h" />
     <ClInclude Include="hooks\Dxgi_Hooks.h" />
@@ -513,6 +515,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="dllmain.h" />
     <ClInclude Include="menu\menu_dx_base.h" />
     <ClInclude Include="menu\menu_common.h" />
+    <ClInclude Include="plugins\PluginApi.h" />
+    <ClInclude Include="..\plugin_sdk\optiscaler_plugin.h" />
     <ClInclude Include="menu\menu_dx11.h" />
     <ClInclude Include="menu\menu_dx12.h" />
     <ClInclude Include="menu\menu_overlay_base.h" />
@@ -788,6 +792,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="hooks\D3D11_Hooks.cpp" />
     <ClCompile Include="hooks\Vulkan_Hooks.cpp" />
     <ClCompile Include="menu\menu_common.cpp" />
+    <ClCompile Include="plugins\PluginApi.cpp" />
     <ClCompile Include="menu\menu_dx_base.cpp" />
     <ClCompile Include="menu\menu_dx11.cpp" />
     <ClCompile Include="menu\menu_dx12.cpp" />
