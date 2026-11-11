@@ -19,7 +19,7 @@
 #include <proxies/XeSS_Proxy.h>
 #include <proxies/XeFG_Proxy.h>
 #include <proxies/XeLL_Proxy.h>
-#include <proxies/NVNGX_Proxy.h>
+#include <proxies/Nvngx_Proxy.h>
 #include <proxies/FfxApi_Proxy.h>
 
 #include "inputs/FSR2_Dx11.h"
@@ -50,6 +50,7 @@
 #include <magic_enum.hpp>
 #include <version_check.h>
 #include <misc/IdentifyGpu.h>
+#include <misc/CrashDumps.h>
 #include <sha1/sha1.hpp>
 
 static std::vector<HMODULE> _asiHandles;
@@ -430,12 +431,19 @@ static bool ShouldLoadReShade()
            !Config::Instance()->CreateD3D12DeviceForLuma.value_or_default();
 }
 
+static bool ShouldLoadForLuma()
+{
+    return Config::Instance()->CreateD3D12DeviceForLuma.value_or_default() &&
+           ((skModule == nullptr && Config::Instance()->LoadSpecialK.value_or_default()) ||
+            (reshadeModule == nullptr && Config::Instance()->LoadReShade.value_or_default()));
+}
+
 static void LoadInjectedDlls()
 {
+    // No RESHADE_DISABLE_GRAPHICS_HOOK, Special K sets it itself when it wants ReShade without hooks
     if (ShouldLoadSpecialK())
     {
         auto skFile = Util::ExePath().parent_path() / L"SpecialK64.dll";
-        SetEnvironmentVariableW(L"RESHADE_DISABLE_GRAPHICS_HOOK", L"1");
 
         State::EnableServeOriginal(200);
         skModule = NtdllProxy::LoadLibraryExW_Ldr(skFile.c_str(), NULL, 0);
@@ -488,13 +496,15 @@ static void RunEntryLoads()
 
     LOG_INFO("Loading injected dlls");
 
-    // So ReShade hooks the factory methods after us, Special K should hook before us
-    if (!ShouldLoadSpecialK())
+    // Special K and ReShade should hook before us, ReShade above our FG swapchain uses freed objects
+    if ((skModule != nullptr || !Config::Instance()->LoadSpecialK.value_or_default()) &&
+        !Config::Instance()->LoadReShade.value_or_default())
         DxgiHooks::HookFactoryMethods();
 
     // Detection fails under the loader lock, nvapi loaded by an injected dll's DllMain would pick fakenvapi
     IdentifyGpu::getAllGpus();
 
+    DxgiHooks::LoadForLuma();
     LoadInjectedDlls();
 
     if (_asiAtEntry)
@@ -1191,6 +1201,14 @@ static void CheckWorkingMode()
         StreamlineHooks::hookDlss(slDlss);
     }
 
+    HMODULE slDlssd = GetDllNameWModule(&slDlssdNamesW);
+    if (slDlssd != nullptr)
+    {
+        State::Instance().postCodes |= PostCode::SlPluginsAlreadyInMemory;
+        LOG_WARN("sl.dlss_d.dll already in memory");
+        StreamlineHooks::hookDlssd(slDlssd);
+    }
+
     HMODULE slDlssg = nullptr;
     slDlssg = GetDllNameWModule(&slDlssgNamesW);
     if (slDlssg != nullptr)
@@ -1345,6 +1363,10 @@ static void CheckWorkingMode()
 
     if ((ShouldLoadSpecialK() || ShouldLoadReShade()) && (!_staticLoad || !HookExeEntry()))
         LoadInjectedDlls();
+
+    // Luma's device can't be created under the loader lock, without the entry hook the first factory does it
+    if (_staticLoad && ShouldLoadForLuma())
+        HookExeEntry();
 
     // Version check
     if (Config::Instance()->CheckForUpdate.value_or_default())
@@ -1752,6 +1774,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         CustomProviders::ResolveDx12Upscaler();
         CustomProviders::ResolveVulkanUpscaler();
         CustomProviders::ResolveFGNvngx();
+        CustomProviders::ResolveRRUpscaler();
 
         spdlog::info("");
         if (Util::GetRealWindowsVersion(winVer))
@@ -1807,6 +1830,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         NtdllProxy::Init();
         KernelBaseProxy::Init();
         Kernel32Proxy::Init();
+
+        CrashDumps::Init();
 
         // Check for Wine
         spdlog::info("");

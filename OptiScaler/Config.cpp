@@ -80,6 +80,11 @@ bool Config::Reload(std::filesystem::path iniPath)
                 CustomUpscalerVk.set_from_config(std::string(ini.GetValue("Upscalers", "VulkanUpscaler")));
             else
                 VulkanUpscaler.set_from_config(vulkanUpscaler);
+
+            // A folder name for ray reconstruction, dlssd is the same as auto, checked by
+            // CustomProviders::ResolveRRUpscaler
+            if (auto rrUpscaler = readString("Upscalers", "RRUpscaler", true); rrUpscaler.value_or("dlssd") != "dlssd")
+                CustomRRUpscaler.set_from_config(std::string(ini.GetValue("Upscalers", "RRUpscaler")));
         }
 
         // Frame Generation
@@ -444,6 +449,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             LogSingleFile.set_from_config(readBool("Log", "SingleFile"));
             LogAsync.set_from_config(readBool("Log", "LogAsync"));
             LogAsyncThreads.set_from_config(readInt("Log", "LogAsyncThreads"));
+            CreateDumps.set_from_config(readBool("Log", "CreateDumps"));
 
             {
                 auto setting = readString("Log", "LogFileName", false);
@@ -1346,6 +1352,8 @@ bool Config::SaveIni()
             ini.SetValue("Upscalers", "VulkanUpscaler", custom.c_str());
         else
             SaveUpscaler("VulkanUpscaler", Instance()->VulkanUpscaler);
+
+        ini.SetValue("Upscalers", "RRUpscaler", Instance()->CustomRRUpscaler.value_for_config_or("auto").c_str());
     }
 
     // Frame Generation
@@ -1935,6 +1943,7 @@ bool Config::SaveIni()
                      wstring_to_string(Instance()->LogFileName.value_for_config_or(L"auto")).c_str());
         ini.SetValue("Log", "LogAsync", GetBoolValue(Instance()->LogAsync.value_for_config()).c_str());
         ini.SetValue("Log", "LogAsyncThreads", GetIntValue(Instance()->LogAsyncThreads.value_for_config()).c_str());
+        ini.SetValue("Log", "CreateDumps", GetBoolValue(Instance()->CreateDumps.value_for_config()).c_str());
     }
 
     // NvApi
